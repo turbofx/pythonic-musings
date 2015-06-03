@@ -145,8 +145,11 @@ class chunkomatic(object):
                     failure += 1
         debug("Some assembly required... batteries not included.")
         if failure == 0:
+            cwd = os.getcwd()
+            os.chdir(os.path.abspath(location2store))
             debug("All chunks were fetched successfully!")
             self.assemble_chunks(temp_clist, section)
+            os.chdir(cwd)
         else:
             debug("Failed chunks: %d\nSuccessful: %d" % (failure, success))
     
