@@ -8,11 +8,12 @@
 # because of the distributed lock manager
 
 import os, sys, datetime, argparse
-from threading import Thread
-from multiprocessing import Process
 from time import sleep
+import threading, multiprocessing
+import Queue
 
 RANDOM_DEVICE = '/dev/urandom'
+TMP_STORAGE = '/tmp/dbipc'
 
 DEBUG = False
 
@@ -31,23 +32,38 @@ class pc_object:
     status = 0
 
 class paper_cuts(object):
-    def __init__(self, size_of_file, num_of_files, num_of_threads, dir_location, default_filename):
+    def __init__(self, size_of_file, num_of_files, num_of_threads, multi_proc, dir_location, default_filename):
         self.size_of_file = size_of_file
         self.default_filename = default_filename
         self.dir_location = dir_location
         self.pcobj = {} # paper cut thread objects
         self.num_of_files = num_of_files
         self.num_of_threads = num_of_threads
+        self.result_list = []
+        self.multi_proc = multi_proc
+        self.setup_output_queue()
 
-
+    
     def generate_data(self):
         x = open(RANDOM_DEVICE, 'rb')
         result = x.read(self.size_of_file)
         x.close()
         return result
-    
 
-    def start_threads(self, thread_type=1, multi_proc=False):
+    
+    def setup_output_queue(self):
+        if self.multi_proc:
+            self.multi_proc_queue = multiprocessing.Queue()
+        else:
+            self.multi_proc_queue = Queue.Queue()
+
+    
+    def write_output_queue(self, tnum, msg, time_str):
+        self.multi_proc_queue.put((tnum, msg, time_str))
+        debug("%03d : %s" % (tnum, msg))
+
+    
+    def start_threads(self, thread_type=1):
         '''
         This function spins up thread_count number of threads
         plus any other threads needed to clean up the mess.
@@ -68,12 +84,15 @@ class paper_cuts(object):
             self.pcobj[x].filename_prefix = '%s_%d_' % (self.default_filename, x)
             self.pcobj[x].num_of_files = self.num_of_files
 
-            if multi_proc:
-                self.pcobj[x].worker_engine_thread = Process(target=self.worker_engine, args=(x,))
+            if self.multi_proc:
+                self.pcobj[x].thread_type = 'p'
+                self.pcobj[x].worker_engine_thread = multiprocessing.Process(target=self.worker_engine, args=(x,))
             else:
-                self.pcobj[x].worker_engine_thread = Thread(target=self.worker_engine, args=(x,))
+                self.pcobj[x].thread_type = 't'
+                self.pcobj[x].worker_engine_thread = threading.Thread(target=self.worker_engine, args=(x,))
 
             self.pcobj[x].worker_engine_thread.start()
+
         return
 
 
@@ -92,9 +111,16 @@ class paper_cuts(object):
         # delete
         self.delete_files(tnum)
         debug("[%d] Good Night!" % tnum)
-
+        
         # Mark the thread as dead.
         self.pcobj[tnum].status = "DEAD"
+        
+        
+        self.write_output_queue(tnum, "DEAD", 0)
+        while self.multi_proc_queue.qsize() != 0:
+            debug("Queue not empty! %d" % self.multi_proc_queue.qsize())
+        debug("[%d] Queue Empty Leaving!" % tnum)
+        
         return
 
 
@@ -121,6 +147,7 @@ class paper_cuts(object):
             if os.write(x, chunk) != len(chunk):
                 error("Error writing count: %d" % count)
             os.close(x)
+            #self.write_output_queue(tnum, "Created file: %s" % (fname_prefix + str(self.pcobj[tnum].write_count)))
             debug("[%d] created file: %s" % (tnum, (fname_prefix + str(self.pcobj[tnum].write_count))))
             self.pcobj[tnum].write_count += 1
         
@@ -129,6 +156,8 @@ class paper_cuts(object):
         self.pcobj[tnum].status = "CREATE_DONE"
         self.pcobj[tnum].create_files_running_time = (self.pcobj[tnum].create_files_stop_time - 
                                                       self.pcobj[tnum].create_files_start_time)
+        
+        self.write_output_queue(tnum, "Create", self.pcobj[tnum].create_files_running_time)
         return
 
         
@@ -166,7 +195,6 @@ class paper_cuts(object):
         return
         
                 
-
     def delete_files(self, tnum):
         '''
         This function deletes files...
@@ -177,6 +205,7 @@ class paper_cuts(object):
         self.pcobj[tnum].delete_files_start_time = datetime.datetime.now()
         debug("[%d] files to delete: %d" % (tnum, self.pcobj[tnum].write_count))
         #os.system('rm -f %s' % (self.pcobj[tnum].filename_prefix + '*'))
+        
         while (count <= self.pcobj[tnum].write_count):
             try:
                 if os.path.isfile('./' + self.pcobj[tnum].filename_prefix + str(count)):
@@ -193,34 +222,55 @@ class paper_cuts(object):
         os.chdir(cwd)
         self.pcobj[tnum].delete_files_running_time = (self.pcobj[tnum].delete_files_stop_time - 
                                                       self.pcobj[tnum].delete_files_start_time)
+        
+        self.write_output_queue(tnum, "Delete", self.pcobj[tnum].delete_files_running_time)
         return
 
 
-    def thread_cleanup(self):
+    def thread_collect(self):
+        debug("Thread Collect started!")
         done = False
+        count = 0
         while not done:
-            count = 0
-            for k in self.pcobj.keys():
-                if self.pcobj[k].status == "DEAD":
-                    count += 1
-            if count == self.num_of_threads:
-                debug("All threads reporting dead... leaving!")
-                done = True
-            else:
-                sleep(1) # sleep on second and try again.
-        return
 
-    
+            result = self.multi_proc_queue.get()
+            debug("%d %s %s" % tuple(result))
+
+            if result[1] == "DEAD":
+                debug("Got a dead message!")
+                count += 1
+                debug("Count: %d Num of threads: %d" % (count, self.num_of_threads))
+            else:
+                self.result_list.append(result)
+
+            if count == self.num_of_threads:
+                debug("All sub processes are dead!")
+                done = True
+            
+        debug("Leaving Collect")
+        return                
+
+
+    def compute_speed(self, delta_time):
+        try:
+            return float((self.num_of_files * self.size_of_file) / delta_time.total_seconds())
+        except AttributeError:
+            return 0
+            #return float((self.num_of_files * self.size_of_file) / delta_time.seconds)
+
+
     def print_results(self):
         '''
         This function takes all the data in the pcobj dictionary and creates a report
         '''
-        print "THR : Action : Time Taken"
+        print "%s : Action : Time Taken" % ("PRC" if self.multi_proc else "THR")
         print "----|--------|-----------"
-        for k in self.pcobj.keys():
-            print "%03d : Create : %s" % (k, self.pcobj[k].create_files_running_time)
-            print "%03d : Delete : %s" % (k, self.pcobj[k].delete_files_running_time)
+
+        for l in sorted(self.result_list):
+            print "%03d : %s : %s" % tuple(l), "%f" % self.compute_speed(l[2])
             
+        return
+
 
 def process_commandline():
     parser = argparse.ArgumentParser()
@@ -230,7 +280,7 @@ def process_commandline():
     parser.add_argument('-t', '--num-of-threads', default='10')
     parser.add_argument('-f', '--file-prefix', default='dbipc')
     parser.add_argument('-p', '--private', default='1')
-    parser.add_argument('-m', '--multiprocessing', action='store_true') 
+    parser.add_argument('-m', '--multiprocessing', action='store_true')
     args = parser.parse_args()
     if args.location == None:
         print "You must specify a location!!"
@@ -243,6 +293,7 @@ def main(argv):
     x = paper_cuts(int(inputs.blocksize), 
                    int(inputs.num_of_files),
                    int(inputs.num_of_threads),
+                   inputs.multiprocessing,
                    inputs.location,
                    inputs.file_prefix)
                    
@@ -254,8 +305,8 @@ def main(argv):
         exit(0)
     cwd = os.getcwd()
     os.chdir(inputs.location)
-    x.start_threads(inputs.private, inputs.multiprocessing)
-    x.thread_cleanup()
+    x.start_threads(inputs.private)
+    x.thread_collect()
     x.print_results()
     os.chdir(cwd)
 
